@@ -1,11 +1,5 @@
 # Cell extracted from notebook
 
-!pip install -U --quiet langgraph langchain_openai
-
-
-
-# Cell extracted from notebook
-
 import getpass
 import os
 
@@ -15,8 +9,6 @@ def _set_if_undefined(var: str):
         os.environ[var] = getpass.getpass(f"Please provide your {var}")
 
 
-_set_if_undefined("OPENAI_API_KEY")               # For calling LLM. Get from https://platform.openai.com/
-_set_if_undefined("FINANCIAL_DATASETS_API_KEY")   # For getting financial data. Get from https://financialdatasets.ai
 
 
 
@@ -31,22 +23,26 @@ import matplotlib.pyplot as plt
 import yfinance as yf  # Add yfinance for stock data
 
 # Import your agent's dependencies
-from langchain_openai.chat_models import ChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain.callbacks.manager import CallbackManager
+from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
 from langgraph.graph import END, MessagesState, StateGraph, START
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.output_parsers import JsonOutputParser
-from pydantic import BaseModel, Field
-from typing import Literal
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.outputs import ChatGeneration, ChatResult
+from typing import Any, Dict, List, Optional, Iterator
+import requests
+from langchain_ollama import ChatOllama
 
-
-
-# Cell extracted from notebook
-
-# We use GPT-4o, but you can use any LLM
-llm = ChatOpenAI(model="gpt-4o")
-
-
+# Initialize the ChatOllama model with proper format settings
+llm = ChatOllama(
+    model="qwen2.5:7b",  # Change to a model you have installed
+    temperature=0,
+    format="json",  # Specify the format as json
+    callback_manager=CallbackManager([StreamingStdOutCallbackHandler()]),
+    stop=["Human:", "Assistant:"],  # Add stop sequences
+    num_ctx=4096,  # Adjust context window if needed
+)
 
 # Cell extracted from notebook
 
@@ -85,7 +81,12 @@ def market_data_agent(state: MessagesState):
 def quant_agent(state: MessagesState):
     """Analyzes technical indicators and generates trading signals"""
     last_message = state["messages"][-1]
+    human_message_content = (f"""Based on the trading signals below, analyze the data and provide your assessment.
 
+                Trading Analysis: {last_message.content}
+
+                Only include your trading direction and confidence in the output.
+                """)
     summary_prompt = ChatPromptTemplate.from_messages(
         [
             (
@@ -93,19 +94,14 @@ def quant_agent(state: MessagesState):
                 """You are a hedge fund quant / technical analyst.
                 You are given trading signals for a stock.
                 Analyze the signals and provide a recommendation.
-                - signal: bullish | bearish | neutral,
+                - direction: bullish | bearish | neutral,
                 - confidence: <float between 0 and 1>
                 """
             ),
             MessagesPlaceholder(variable_name="messages"),
             (
                 "human",
-                f"""Based on the trading signals below, analyze the data and provide your assessment.
-
-                Trading Analysis: {last_message.content}
-
-                Only include your trading signal and confidence in the output.
-                """
+                human_message_content
             ),
         ]
     )
@@ -122,12 +118,22 @@ def quant_agent(state: MessagesState):
 
 
 
-# Cell extracted from notebook
-
 def risk_management_agent(state: MessagesState):
     """Evaluates portfolio risk and sets position limits"""
     portfolio = state["messages"][0].additional_kwargs["portfolio"]
     last_message = state["messages"][-1]
+    human_message_content = (f"""Based on the trading analysis below, provide your risk assessment.
+
+                Trading Analysis: {last_message.content}
+
+                Here is the current portfolio:
+                Portfolio:
+                Cash: ${portfolio['cash']:.2f}
+                Current Position: {portfolio['stock']} shares
+
+                Only include the max position size and risk score in your output.
+                """)
+    human_message_content = human_message_content.replace("{", "{{").replace("}", "}}")
 
     risk_prompt = ChatPromptTemplate.from_messages(
         [
@@ -143,17 +149,8 @@ def risk_management_agent(state: MessagesState):
             MessagesPlaceholder(variable_name="messages"),
             (
                 "human",
-                f"""Based on the trading analysis below, provide your risk assessment.
+                human_message_content
 
-                Trading Analysis: {last_message.content}
-
-                Here is the current portfolio:
-                Portfolio:
-                Cash: ${portfolio['cash']:.2f}
-                Current Position: {portfolio['stock']} shares
-
-                Only include the max position size and risk score in your output.
-                """
             ),
         ]
     )
@@ -173,6 +170,22 @@ def portfolio_management_agent(state: MessagesState):
     """Makes final trading decisions and generates orders"""
     portfolio = state["messages"][0].additional_kwargs["portfolio"]
     last_message = state["messages"][-1]
+    human_message_content = (f"""Based on the risk management data below, make your trading decision.
+
+                Risk Management Data: {last_message.content}
+
+                Here is the current portfolio:
+                Portfolio:
+                Cash: ${portfolio['cash']:.2f}
+                Current Position: {portfolio['stock']} shares
+
+                Only include the action and quantity.
+
+                Remember, the action must be either buy, sell, or hold.
+                You can only buy if you have available cash.
+                You can only sell if you have shares in the portfolio to sell.
+                """)
+    human_message_content = human_message_content.replace("{", "{{").replace("}", "}}")
 
     portfolio_prompt = ChatPromptTemplate.from_messages(
         [
@@ -191,21 +204,7 @@ def portfolio_management_agent(state: MessagesState):
             MessagesPlaceholder(variable_name="messages"),
             (
                 "human",
-                f"""Based on the risk management data below, make your trading decision.
-
-                Risk Management Data: {last_message.content}
-
-                Here is the current portfolio:
-                Portfolio:
-                Cash: ${portfolio['cash']:.2f}
-                Current Position: {portfolio['stock']} shares
-
-                Only include the action and quantity.
-
-                Remember, the action must be either buy, sell, or hold.
-                You can only buy if you have available cash.
-                You can only sell if you have shares in the portfolio to sell.
-                """
+                human_message_content
             ),
         ]
     )
@@ -266,17 +265,25 @@ def run_agent(ticker: str, start_date: str, end_date: str, portfolio: dict):
 
 # Define a function to calculate trading signals
 def calculate_trading_signals(historical_data: pd.DataFrame) -> dict:
-    """Calculate trading signals based on SMA crossover strategy"""
-    # Calculate SMAs
-    sma_5 = historical_data["close"].rolling(window=5).mean()
-    sma_20 = historical_data["close"].rolling(window=20).mean()
+    """Calculate trading signals based on SMA crossover strategy
+    
+    Args:
+        historical_data: DataFrame with multi-level columns [ticker, OHLCV]
+    """
+    # Get the ticker from the first level of the column index
+    ticker = historical_data.columns.get_level_values(1)[0]
+    close = historical_data.columns.get_level_values(0)[1]
+    
+    # Calculate SMAs using the close price for the ticker
+    sma_5 = historical_data[close][ticker].rolling(window=5).mean()
+    sma_20 = historical_data[close][ticker].rolling(window=20).mean()
 
     # Get the last two points of each SMA to check for crossover
     sma_5_prev, sma_5_curr = sma_5.iloc[-2:]
     sma_20_prev, sma_20_curr = sma_20.iloc[-2:]
 
     return {
-        "current_price": historical_data["close"].iloc[-1],
+        "current_price": historical_data[close][ticker].iloc[-1],
         "sma_5_curr": sma_5_curr,
         "sma_5_prev": sma_5_prev,
         "sma_20_curr": sma_20_curr,
@@ -372,7 +379,9 @@ class Backtester:
 
             action, quantity = self.parse_action(agent_output)
             df = get_price_data(self.ticker, lookback_start, current_date_str)
-            current_price = df.iloc[-1]['close']
+            ticker = df.columns.get_level_values(1)[0]
+            close = df.columns.get_level_values(0)[1]
+            current_price = df[close][ticker].iloc[-1]
 
             # Execute the trade with validation
             executed_quantity = self.execute_trade(action, quantity, current_price)
