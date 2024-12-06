@@ -28,6 +28,7 @@ import requests
 import os
 from datetime import timedelta
 import matplotlib.pyplot as plt
+import yfinance as yf  # Add yfinance for stock data
 
 # Import your agent's dependencies
 from langchain_openai.chat_models import ChatOpenAI
@@ -286,47 +287,17 @@ def calculate_trading_signals(historical_data: pd.DataFrame) -> dict:
 
 # Cell extracted from notebook
 
-# Move the price data fetching function into the agent's scope
+# Update the price data fetching function to use yfinance
 def get_price_data(ticker, start_date, end_date):
-    # Add your API key to the headers
-    headers = {"X-API-KEY": os.environ.get("FINANCIAL_DATASETS_API_KEY")}
+    # Fetch data using yfinance
+    df = yf.download(ticker, start=start_date, end=end_date, interval='1d')
 
-    # Create the URL
-    url = (
-        f"https://api.financialdatasets.ai/prices/"
-        f"?ticker={ticker}"
-        f"&interval=day"
-        f"&interval_multiplier=1"
-        f"&start_date={start_date}"
-        f"&end_date={end_date}"
-    )
-
-    # Make API request
-    response = requests.get(url, headers=headers)
-
-    # Check for successful response
-    if response.status_code != 200:
-        raise Exception(
-            f"Error fetching data: {response.status_code} - {response.text}"
-        )
-
-    # Parse prices from the response
-    data = response.json()
-    prices = data.get("prices")
-    if not prices:
+    # Ensure the DataFrame has the necessary columns
+    if df.empty or 'Close' not in df.columns:
         raise ValueError("No price data returned")
 
-    # Convert prices to DataFrame
-    df = pd.DataFrame(prices)
-
-    # Convert 'time' to datetime and set as index
-    df["Date"] = pd.to_datetime(df["time"])
-    df.set_index("Date", inplace=True)
-
-    # Ensure numeric data types
-    numeric_cols = ["open", "close", "high", "low", "volume"]
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Rename columns to match the expected format
+    df.rename(columns={'Close': 'close', 'Open': 'open', 'High': 'high', 'Low': 'low', 'Volume': 'volume'}, inplace=True)
 
     # Sort by date
     df.sort_index(inplace=True)
